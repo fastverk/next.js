@@ -1620,6 +1620,8 @@ pub async fn read_matches(
                             };
                             let path = concat(&prefix, str).into();
                             if link_type.contains(LinkType::DIRECTORY) {
+                                // Includes `OUTSIDE_ROOT` directories. Resolution still traverses
+                                // through the symlink path itself.
                                 results.push((index, PatternMatch::Directory(path, fs_path)));
                             } else {
                                 results.push((index, PatternMatch::File(path, fs_path)))
@@ -1807,6 +1809,7 @@ pub async fn read_matches(
                                         &*fs_path.read_link().await?
                                     {
                                         if link_type.contains(LinkType::DIRECTORY) {
+                                            // Includes `OUTSIDE_ROOT` directories.
                                             results.push((
                                                 pos,
                                                 PatternMatch::Directory(
@@ -1829,6 +1832,7 @@ pub async fn read_matches(
                                         &*fs_path.read_link().await?
                                         && link_type.contains(LinkType::DIRECTORY)
                                     {
+                                        // Includes `OUTSIDE_ROOT` directories.
                                         results.push((
                                             pos,
                                             PatternMatch::Directory(prefix.clone().into(), fs_path),
@@ -1841,6 +1845,7 @@ pub async fn read_matches(
                                         &*fs_path.read_link().await?
                                         && link_type.contains(LinkType::DIRECTORY)
                                     {
+                                        // Includes `OUTSIDE_ROOT` directories.
                                         results.push((
                                             pos,
                                             PatternMatch::Directory(prefix.clone().into(), fs_path),
@@ -1905,7 +1910,11 @@ fn split_last_segment(path: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        fs::{File, create_dir_all},
+        io::Write,
+        path::Path,
+    };
 
     use rstest::*;
     use turbo_rcstr::{RcStr, rcstr};
@@ -1915,6 +1924,28 @@ mod tests {
     use super::{
         Pattern, longest_common_prefix, longest_common_suffix, read_matches, split_last_segment,
     };
+
+    fn symlink<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+        target: Q,
+        path: P,
+    ) -> std::io::Result<()> {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&path);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, path)
+        }
+        #[cfg(windows)]
+        {
+            let metadata = std::fs::metadata(&target).ok();
+            if metadata.is_none_or(|m| m.is_file()) {
+                std::os::windows::fs::symlink_file(target, path)
+            } else {
+                std::os::windows::fs::junction_point(target, path)
+            }
+        }
+    }
 
     #[test]
     fn longest_common_prefix_test() {
@@ -2724,6 +2755,55 @@ mod tests {
                 .collect::<Vec<_>>()
             );
 
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_read_matches_outside_root_symlink_directory() {
+        #[turbo_tasks::function(operation, root)]
+        async fn read_matches_outside_root_operation(root: RcStr) -> anyhow::Result<()> {
+            let root = DiskFileSystem::new(rcstr!("test"), Vc::cell(root))
+                .root()
+                .owned()
+                .await?;
+
+            let matches = read_matches(
+                root,
+                rcstr!(""),
+                false,
+                Pattern::new(Pattern::Constant(rcstr!("node_modules/pkg/index.js"))),
+            )
+            .await?
+            .into_iter()
+            .map(|m| m.name().to_string())
+            .collect::<Vec<_>>();
+            assert_eq!(matches, vec!["node_modules/pkg/index.js"]);
+            Ok(())
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let outside_pkg = scratch.path().join("outside/pkg");
+        let project = scratch.path().join("project");
+        create_dir_all(project.join("node_modules")).unwrap();
+        create_dir_all(&outside_pkg).unwrap();
+        File::create_new(outside_pkg.join("index.js"))
+            .unwrap()
+            .write_all(b"module.exports = 'ok'")
+            .unwrap();
+        symlink(&outside_pkg, project.join("node_modules/pkg")).unwrap();
+
+        let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions::default(),
+            noop_backing_storage(),
+        ));
+        let root: RcStr = project.to_str().unwrap().into();
+        tt.run_once(async move {
+            read_matches_outside_root_operation(root)
+                .read_strongly_consistent()
+                .await?;
             anyhow::Ok(())
         })
         .await

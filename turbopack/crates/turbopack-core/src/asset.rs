@@ -98,6 +98,10 @@ impl AssetContent {
                 path.write(**file).as_side_effect().await?;
             }
             AssetContent::Redirect { target, link_type } => {
+                debug_assert!(
+                    !link_type.contains(LinkType::OUTSIDE_ROOT),
+                    "outside-root symlinks are emitted as AssetContent::File, not Redirect"
+                );
                 path.write_symbolic_link_dir(
                     LinkContent::Link {
                         target: target.clone(),
