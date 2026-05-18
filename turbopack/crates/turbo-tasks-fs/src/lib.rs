@@ -874,40 +874,61 @@ impl FileSystem for DiskFileSystem {
         // other OS this gets compiled away
         let result = simplified(&file).strip_prefix(simplified(Path::new(&self.inner.root)));
 
-        let relative_to_root_path = match result {
-            Ok(file) => PathBuf::from(sys_to_unix(&file.to_string_lossy()).as_ref()),
-            Err(_) => return Ok(LinkContent::Invalid.cell()),
-        };
-
-        let (target, file_type) = if is_link_absolute {
-            let target_string = RcStr::from(relative_to_root_path.to_string_lossy());
-            (
-                target_string.clone(),
-                FileSystemPath::new_normalized_unchecked(
-                    fs_path.fs().to_resolved().await?,
-                    target_string,
+        let (target, is_directory, is_outside_root) = match result {
+            Ok(relative_to_root_path) => {
+                let relative_to_root_path =
+                    PathBuf::from(sys_to_unix(&relative_to_root_path.to_string_lossy()).as_ref());
+                let (target, file_type) = if is_link_absolute {
+                    let target_string = RcStr::from(relative_to_root_path.to_string_lossy());
+                    (
+                        target_string.clone(),
+                        FileSystemPath::new_normalized_unchecked(
+                            fs_path.fs().to_resolved().await?,
+                            target_string,
+                        )
+                        .get_type()
+                        .await?,
+                    )
+                } else {
+                    let link_path_string_cow = link_path.to_string_lossy();
+                    let link_path_unix = RcStr::from(sys_to_unix(&link_path_string_cow));
+                    (
+                        link_path_unix.clone(),
+                        fs_path.parent().join(&link_path_unix)?.get_type().await?,
+                    )
+                };
+                (
+                    target,
+                    matches!(&*file_type, FileSystemEntryType::Directory),
+                    false,
                 )
-                .get_type()
-                .await?,
-            )
-        } else {
-            let link_path_string_cow = link_path.to_string_lossy();
-            let link_path_unix = RcStr::from(sys_to_unix(&link_path_string_cow));
-            (
-                link_path_unix.clone(),
-                fs_path.parent().join(&link_path_unix)?.get_type().await?,
-            )
+            }
+            Err(_) => {
+                let metadata =
+                    extract_disk_access(retry_blocking(|| std::fs::metadata(&file)).await, &file)?;
+                let Some(metadata) = metadata else {
+                    return Ok(LinkContent::Invalid.cell());
+                };
+                (
+                    RcStr::from(sys_to_unix(&file.to_string_lossy())),
+                    metadata.is_dir(),
+                    true,
+                )
+            }
         };
 
         Ok(LinkContent::Link {
             target,
             link_type: {
                 let mut link_type = Default::default();
-                if link_path.is_absolute() {
+                if link_path.is_absolute() || is_outside_root {
                     link_type |= LinkType::ABSOLUTE;
                 }
-                if matches!(&*file_type, FileSystemEntryType::Directory) {
+                if is_directory {
                     link_type |= LinkType::DIRECTORY;
+                }
+                if is_outside_root {
+                    link_type |= LinkType::OUTSIDE_ROOT;
                 }
                 link_type
             },
@@ -1149,6 +1170,7 @@ impl FileSystem for DiskFileSystem {
                     Link {
                         #[cfg(windows)]
                         is_directory: bool,
+                        is_outside_root: bool,
                         target: PathBuf,
                     },
                     NotFound,
@@ -1175,6 +1197,7 @@ impl FileSystem for DiskFileSystem {
                         OsSpecificLinkContent::Link {
                             #[cfg(windows)]
                             is_directory,
+                            is_outside_root: link_type.contains(LinkType::OUTSIDE_ROOT),
                             target: target_path,
                         }
                     }
@@ -1192,9 +1215,31 @@ impl FileSystem for DiskFileSystem {
                 };
                 let is_equal = match (&os_specific_link_content, &old_content) {
                     (
-                        OsSpecificLinkContent::Link { target, .. },
+                        OsSpecificLinkContent::Link {
+                            target,
+                            is_outside_root,
+                            ..
+                        },
                         Some((old_is_absolute, old_target)),
-                    ) => target == old_target && target.is_absolute() == *old_is_absolute,
+                    ) => {
+                        if *is_outside_root {
+                            let resolve_target = |target: &Path, is_absolute: bool| {
+                                let path = if is_absolute {
+                                    target.to_path_buf()
+                                } else {
+                                    full_path
+                                        .parent()
+                                        .unwrap_or(full_path.as_ref())
+                                        .join(target)
+                                };
+                                PathBuf::from(simplified(&path))
+                            };
+                            resolve_target(target, target.is_absolute())
+                                == resolve_target(old_target, *old_is_absolute)
+                        } else {
+                            target == old_target && target.is_absolute() == *old_is_absolute
+                        }
+                    }
                     (OsSpecificLinkContent::NotFound, None) => true,
                     _ => false,
                 };
@@ -2089,6 +2134,11 @@ bitflags! {
   pub struct LinkType: u8 {
       const DIRECTORY = 0b00000001;
       const ABSOLUTE = 0b00000010;
+      /// The symlink resolves to a target outside of the configured FileSystem root.
+      ///
+      /// Turbopack cannot represent that target as a `FileSystemPath`, but direct file operations
+      /// can still succeed through the symlink.
+      const OUTSIDE_ROOT = 0b00000100;
   }
 }
 
@@ -2597,10 +2647,31 @@ impl DirectoryEntry {
                     turbofmt!("Symlink {symlink} points at {real_path} which does not exist")
                         .await?,
                 ),
-                // This is caused by eventual consistency
-                FileSystemEntryType::Symlink => turbobail!(
-                    "Symlink {symlink} points at a symlink but realpath_with_links returned a path"
-                ),
+                FileSystemEntryType::Symlink => {
+                    let Some(sys_path) = to_sys_path(real_path.clone()).await? else {
+                        return Ok(self);
+                    };
+                    let metadata = extract_disk_access(
+                        retry_blocking(|| std::fs::metadata(&sys_path)).await,
+                        &sys_path,
+                    )?;
+                    let Some(metadata) = metadata else {
+                        return Ok(DirectoryEntry::Error(
+                            turbofmt!(
+                                "Symlink {symlink} points at {real_path} which does not exist"
+                            )
+                            .await?,
+                        ));
+                    };
+                    let file_type = metadata.file_type();
+                    if file_type.is_dir() {
+                        DirectoryEntry::Directory(real_path.clone())
+                    } else if file_type.is_file() {
+                        DirectoryEntry::File(real_path.clone())
+                    } else {
+                        self
+                    }
+                }
                 _ => self,
             })
         } else {
@@ -2881,6 +2952,13 @@ async fn realpath_with_links(path: FileSystemPath) -> Result<Vc<RealPathResult>>
                     parent_path
                 }
                 .join(target)?;
+                if link_type.contains(LinkType::OUTSIDE_ROOT) {
+                    return Ok(RealPathResult {
+                        path_result: Ok(current_path),
+                        symlinks: symlinks.into_iter().collect(),
+                    }
+                    .cell());
+                }
             }
             LinkContent::NotFound => {
                 error = RealPathResultError::NotFound;
@@ -3373,6 +3451,179 @@ mod tests {
             .unwrap();
 
             tt.stop_and_wait().await;
+        }
+
+        fn symlink<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+            target: Q,
+            path: P,
+        ) -> std::io::Result<()> {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(&path);
+
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(target, path)
+            }
+            #[cfg(windows)]
+            {
+                let metadata = std::fs::metadata(&target).ok();
+                if metadata.is_none_or(|m| m.is_file()) {
+                    std::os::windows::fs::symlink_file(target, path)
+                } else {
+                    std::os::windows::fs::junction_point(target, path)
+                }
+            }
+        }
+
+        #[turbo_tasks::function(operation, root)]
+        async fn assert_outside_root_symlink_read_and_realpath_operation(
+            root: RcStr,
+        ) -> anyhow::Result<()> {
+            let fs = disk_file_system_operation(root)
+                .resolve()
+                .strongly_consistent()
+                .await?;
+            let root = disk_file_system_root(fs);
+            let link = root.join("link.txt")?;
+
+            let link_content = link.read_link().await?;
+            match &*link_content {
+                LinkContent::Link { link_type, .. } => {
+                    assert!(link_type.contains(LinkType::OUTSIDE_ROOT));
+                    assert!(link_type.contains(LinkType::ABSOLUTE));
+                }
+                _ => panic!("expected valid outside-root symlink, got {link_content:?}"),
+            }
+
+            let content = link.read().await?;
+            assert!(matches!(&*content, crate::FileContent::Content(_)));
+
+            let realpath = link.realpath_with_links().await?;
+            assert!(matches!(realpath.path_result, Ok(_)));
+
+            Ok(())
+        }
+
+        #[turbo_tasks::function(operation, root)]
+        async fn assert_outside_root_link_operation(
+            root: RcStr,
+            link_name: RcStr,
+        ) -> anyhow::Result<()> {
+            let fs = disk_file_system_operation(root)
+                .resolve()
+                .strongly_consistent()
+                .await?;
+            let root_path = disk_file_system_root(fs);
+            let link = root_path.join(link_name.as_str())?;
+
+            let link_content = link.read_link().await?;
+            match &*link_content {
+                LinkContent::Link { link_type, .. } => {
+                    assert!(link_type.contains(LinkType::OUTSIDE_ROOT));
+                }
+                _ => panic!("expected valid outside-root symlink, got {link_content:?}"),
+            }
+
+            Ok(())
+        }
+
+        #[turbo_tasks::function(operation, root)]
+        async fn write_link_round_trip_operation(
+            fs: ResolvedVc<DiskFileSystem>,
+            link: FileSystemPath,
+            target: RcStr,
+        ) -> anyhow::Result<()> {
+            let content = LinkContent::Link {
+                target,
+                link_type: LinkType::ABSOLUTE | LinkType::OUTSIDE_ROOT,
+            }
+            .cell();
+            fs.write_link(link, content).await?;
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_outside_root_symlink_read_and_realpath() {
+            let scratch = tempfile::tempdir().unwrap();
+            let root_path = scratch.path().join("root");
+            let outside_path = scratch.path().join("outside");
+            create_dir_all(&root_path).unwrap();
+            create_dir_all(&outside_path).unwrap();
+            File::create_new(outside_path.join("data.txt"))
+                .unwrap()
+                .write_all(b"outside")
+                .unwrap();
+            symlink("../outside/data.txt", root_path.join("link.txt")).unwrap();
+
+            let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+                BackendOptions::default(),
+                noop_backing_storage(),
+            ));
+            let root: RcStr = root_path.to_str().unwrap().into();
+            tt.run_once(async move {
+                assert_outside_root_symlink_read_and_realpath_operation(root)
+                    .read_strongly_consistent()
+                    .await?;
+                anyhow::Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_write_link_round_trip_for_outside_root_target() {
+            let scratch = tempfile::tempdir().unwrap();
+            let path = scratch.path().to_owned();
+            create_dir_all(path.join("root")).unwrap();
+            create_dir_all(path.join("outside")).unwrap();
+            File::create_new(path.join("outside/data.txt"))
+                .unwrap()
+                .write_all(b"outside")
+                .unwrap();
+            let root = RcStr::from(path.join("root").to_str().unwrap());
+            let target = RcStr::from(turbo_unix_path::sys_to_unix(
+                &path.join("outside/data.txt").to_string_lossy(),
+            ));
+
+            let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+                BackendOptions::default(),
+                noop_backing_storage(),
+            ));
+            let root_for_assertion = root.clone();
+            tt.run_once(async move {
+                let fs = disk_file_system_operation(root)
+                    .resolve()
+                    .strongly_consistent()
+                    .await?;
+                let root_path = disk_file_system_root(fs);
+                let link = root_path.join("roundtrip.txt")?;
+                extract_effects_operation(write_link_round_trip_operation(
+                    fs,
+                    link.clone(),
+                    target.clone(),
+                ))
+                .read_strongly_consistent()
+                .await?
+                .apply()
+                .await?;
+                extract_effects_operation(write_link_round_trip_operation(fs, link, target))
+                    .read_strongly_consistent()
+                    .await?
+                    .apply()
+                    .await?;
+                anyhow::Ok(())
+            })
+            .await
+            .unwrap();
+
+            tt.run_once(async move {
+                assert_outside_root_link_operation(root_for_assertion, rcstr!("roundtrip.txt"))
+                    .read_strongly_consistent()
+                    .await?;
+                anyhow::Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 

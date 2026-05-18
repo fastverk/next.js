@@ -87,6 +87,9 @@ async fn read_glob_internal(
                     DirectoryEntry::Symlink(path) => {
                         if let LinkContent::Link { link_type, .. } = &*path.read_link().await? {
                             if link_type.contains(LinkType::DIRECTORY) {
+                                // `OUTSIDE_ROOT` symlinks can still be traversed when they point
+                                // to directories because directory reads happen through the
+                                // symlink path itself.
                                 // Ensure that there are no infinite link loops, but don't resolve
                                 resolve_symlink_safely(entry.clone()).await?;
 
@@ -236,7 +239,8 @@ pub mod tests {
     use turbo_tasks_backend::{BackendOptions, TurboTasksBackend, noop_backing_storage};
 
     use crate::{
-        DirectoryEntry, DiskFileSystem, FileContent, FileSystem, FileSystemPath,
+        DirectoryEntry, DiskFileSystem, FileContent, FileSystem, FileSystemPath, LinkContent,
+        LinkType,
         glob::{Glob, GlobOptions},
     };
 
@@ -381,6 +385,40 @@ pub mod tests {
                     DirectoryEntry::Symlink(root.join("sub/dead_link.js")?),
                 )
             ])
+        );
+
+        Ok(())
+    }
+
+    #[turbo_tasks::function(operation, root)]
+    async fn assert_read_glob_outside_root_directory_operation(path: RcStr) -> anyhow::Result<()> {
+        let fs = DiskFileSystem::new(rcstr!("temp"), Vc::cell(path));
+        let root = fs.root().await?;
+        let linked_dir = root.join("linked_dir")?;
+        let link = linked_dir.read_link().await?;
+        let LinkContent::Link { link_type, .. } = &*link else {
+            anyhow::bail!("linked_dir should be a symlink");
+        };
+        assert!(link_type.contains(LinkType::DIRECTORY));
+        assert!(link_type.contains(LinkType::OUTSIDE_ROOT));
+
+        let read_dir = linked_dir
+            .read_glob(Glob::new(rcstr!("**/*.txt"), GlobOptions::default()))
+            .await?;
+        assert_eq!(read_dir.results.len(), 2);
+        assert_eq!(
+            read_dir.results.get("a.txt"),
+            Some(&DirectoryEntry::File(linked_dir.join("a.txt")?))
+        );
+        assert_eq!(
+            read_dir.results.get("b.txt"),
+            Some(&DirectoryEntry::File(linked_dir.join("b.txt")?))
+        );
+
+        let inner = &*read_dir.inner.get("sub").unwrap().await?;
+        assert_eq!(
+            inner.results.get("c.txt"),
+            Some(&DirectoryEntry::File(linked_dir.join("sub/c.txt")?))
         );
 
         Ok(())
@@ -692,22 +730,33 @@ pub mod tests {
     async fn symlink_escapes_fs_root() {
         let scratch = tempfile::tempdir().unwrap();
         {
-            // Create a simple directory with 1 file and a symlink pointing at a non-existent file
             let path = scratch.path();
-            let sub = &path.join("sub");
-            create_dir(sub).unwrap();
-            let foo = scratch.path().join("foo.js");
-            File::create_new(&foo).unwrap().write_all(b"foo").unwrap();
-            // put a link in sub that points to a parent file
-            symlink(foo, sub.join("escape.js")).unwrap();
+            let outside = path.join("outside");
+            create_dir(&outside).unwrap();
+            File::create_new(outside.join("a.txt"))
+                .unwrap()
+                .write_all(b"a")
+                .unwrap();
+            File::create_new(outside.join("b.txt"))
+                .unwrap()
+                .write_all(b"b")
+                .unwrap();
+            create_dir(outside.join("sub")).unwrap();
+            File::create_new(outside.join("sub/c.txt"))
+                .unwrap()
+                .write_all(b"c")
+                .unwrap();
+
+            create_dir(path.join("root")).unwrap();
+            symlink(path.join("outside"), path.join("root/linked_dir")).unwrap();
         }
         let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
             BackendOptions::default(),
             noop_backing_storage(),
         ));
-        let root: RcStr = scratch.path().join("sub").to_str().unwrap().into();
+        let root: RcStr = scratch.path().join("root").to_str().unwrap().into();
         tt.run_once(async {
-            track_glob_operation(root, rcstr!("*.js"))
+            assert_read_glob_outside_root_directory_operation(root)
                 .read_strongly_consistent()
                 .await?;
             anyhow::Ok(())
