@@ -838,34 +838,68 @@ impl FileSystem for DiskFileSystem {
             }
         }
 
-        // strip the root from the path, it serves two purpose
-        // 1. ensure the linked path is under the root
-        // 2. strip the root path if the linked path is absolute
+        // Strip the root from the path. Two purposes:
+        // 1. determine whether the link target is under this FileSystem's root
+        // 2. strip the root prefix if the link is absolute, so we can store a normalized
+        //    FS-relative target string
         //
-        // we use `dunce::simplify` to strip a potential UNC prefix on windows, on any
-        // other OS this gets compiled away
+        // We use `dunce::simplify` to strip a potential UNC prefix on Windows;
+        // on any other OS this compiles away.
         let result = simplified(&file).strip_prefix(simplified(Path::new(&self.inner.root)));
 
-        let relative_to_root_path = match result {
-            Ok(file) => PathBuf::from(sys_to_unix(&file.to_string_lossy()).as_ref()),
-            Err(_) => return Ok(LinkContent::Invalid.cell()),
+        // If the resolved target falls outside this FS's root, we no longer
+        // return `LinkContent::Invalid` — that conflated "link broken /
+        // unrepresentable target" with "link points to a real file outside
+        // our project chroot," and made it impossible for callers to walk
+        // through normal pnpm-style or Bazel-sandbox symlink layouts.
+        // Instead we return a `Link` with `LinkType::OUTSIDE_ROOT` set,
+        // target = the original system path (best-effort string form).
+        // `realpath_with_links` treats this as a terminal node; content
+        // reads (`FileSystemPath::read` / `open(2)`) traverse the link via
+        // the kernel transparently.
+        let (relative_to_root_path, outside_root) = match result {
+            Ok(file) => (
+                PathBuf::from(sys_to_unix(&file.to_string_lossy()).as_ref()),
+                false,
+            ),
+            Err(_) => (file.clone(), true),
         };
 
-        let (target, file_type) = if is_link_absolute {
+        let (target, file_type) = if outside_root {
+            let target_string: RcStr = sys_to_unix(&file.to_string_lossy()).into();
+            // The target's path is outside this FS's chroot — we can't
+            // ask `FileSystemPath::get_type` (it would normalize through
+            // the chroot and mis-resolve). Use OS-level `std::fs::metadata`
+            // (follows symlinks) to determine the underlying entry type
+            // so consumers like `pattern.rs` can set `LinkType::DIRECTORY`
+            // correctly. Default to Symlink if metadata is unreadable —
+            // a downstream content read will still succeed via `open(2)`.
+            let os_type = std::fs::metadata(&file)
+                .map(|m| {
+                    if m.is_dir() {
+                        FileSystemEntryType::Directory
+                    } else if m.is_file() {
+                        FileSystemEntryType::File
+                    } else {
+                        FileSystemEntryType::Symlink
+                    }
+                })
+                .unwrap_or(FileSystemEntryType::Symlink);
+            (target_string, os_type)
+        } else if is_link_absolute {
             let target_string: RcStr = relative_to_root_path.to_string_lossy().into();
-            (
+            let ft = FileSystemPath::new_normalized(
+                fs_path.fs().to_resolved().await?,
                 target_string.clone(),
-                FileSystemPath::new_normalized(fs_path.fs().to_resolved().await?, target_string)
-                    .get_type()
-                    .await?,
             )
+            .get_type()
+            .await?;
+            (target_string, *ft)
         } else {
             let link_path_string_cow = link_path.to_string_lossy();
             let link_path_unix: RcStr = sys_to_unix(&link_path_string_cow).into();
-            (
-                link_path_unix.clone(),
-                fs_path.parent().join(&link_path_unix)?.get_type().await?,
-            )
+            let ft = fs_path.parent().join(&link_path_unix)?.get_type().await?;
+            (link_path_unix, *ft)
         };
 
         Ok(LinkContent::Link {
@@ -875,8 +909,11 @@ impl FileSystem for DiskFileSystem {
                 if link_path.is_absolute() {
                     link_type |= LinkType::ABSOLUTE;
                 }
-                if matches!(&*file_type, FileSystemEntryType::Directory) {
+                if matches!(&file_type, FileSystemEntryType::Directory) {
                     link_type |= LinkType::DIRECTORY;
+                }
+                if outside_root {
+                    link_type |= LinkType::OUTSIDE_ROOT;
                 }
                 link_type
             },
@@ -1941,6 +1978,22 @@ bitflags! {
   pub struct LinkType: u8 {
       const DIRECTORY = 0b00000001;
       const ABSOLUTE = 0b00000010;
+      /// The symlink target resolves to a path outside the FileSystem's
+      /// configured root. The link is still valid at the OS level —
+      /// `open(2)` will follow it — but Turbopack can't represent the
+      /// resolved target as a `FileSystemPath` within this FS.
+      /// Callers that walk the path graph should treat such a link as
+      /// terminal (the symlink itself is the deepest representable
+      /// node); content reads (`FileSystemPath::read`) work
+      /// transparently because the kernel follows the link.
+      ///
+      /// This shows up in workspace layouts where dependency stores
+      /// (pnpm's `node_modules/.pnpm/`, aspect_rules_js's
+      /// `bazel-out/.../bin/node_modules/.aspect_rules_js/`) live as
+      /// siblings of the project, and in Bazel sandboxes where
+      /// per-action output trees symlink back to a master output base
+      /// outside the sandbox root.
+      const OUTSIDE_ROOT = 0b00000100;
   }
 }
 
@@ -2419,10 +2472,21 @@ impl DirectoryEntry {
                 FileSystemEntryType::NotFound => DirectoryEntry::Error(
                     format!("Symlink {symlink} points at {real_path} which does not exist").into(),
                 ),
-                // This is caused by eventual consistency
-                FileSystemEntryType::Symlink => bail!(
-                    "Symlink {symlink} points at a symlink but realpath_with_links returned a path"
-                ),
+                // Happens when `realpath_with_links` terminates early on
+                // an `OUTSIDE_ROOT` link (target lives outside this FS's
+                // root, so we can't represent the resolved location).
+                // The link itself is openable via the OS; classify it
+                // by what the OS sees at the target via `std::fs::metadata`
+                // (follows symlinks). Fallback to File if we can't read
+                // metadata — content reads still work via the kernel.
+                FileSystemEntryType::Symlink => {
+                    let sys_path = to_sys_path(real_path.clone()).await?;
+                    let sys_metadata = sys_path.and_then(|p| std::fs::metadata(p).ok());
+                    match sys_metadata {
+                        Some(meta) if meta.is_dir() => DirectoryEntry::Directory(real_path.clone()),
+                        _ => DirectoryEntry::File(real_path.clone()),
+                    }
+                }
                 _ => self,
             })
         } else {
@@ -2706,6 +2770,21 @@ async fn realpath_with_links(path: FileSystemPath) -> Result<Vc<RealPathResult>>
 
         match &*current_path.read_link().await? {
             LinkContent::Link { target, link_type } => {
+                // OUTSIDE_ROOT: the link target falls outside this FS's
+                // root. We can't represent it as a `FileSystemPath`, but
+                // the link itself is a valid path that the OS will
+                // follow on content reads. Treat as terminal — the
+                // current path *is* its realpath as far as Turbopack's
+                // path graph is concerned. See the `LinkType::OUTSIDE_ROOT`
+                // doc comment for the full rationale.
+                if link_type.contains(LinkType::OUTSIDE_ROOT) {
+                    symlinks.insert(current_path.clone());
+                    return Ok(RealPathResult {
+                        path_result: Ok(current_path),
+                        symlinks: symlinks.into_iter().collect(),
+                    }
+                    .cell());
+                }
                 symlinks.insert(current_path.clone());
                 current_path = if link_type.contains(LinkType::ABSOLUTE) {
                     current_path.root().owned().await?
@@ -2719,6 +2798,11 @@ async fn realpath_with_links(path: FileSystemPath) -> Result<Vc<RealPathResult>>
                 break;
             }
             LinkContent::Invalid => {
+                // After the read_link out-of-root fix above, `Invalid` is
+                // reserved for legitimately broken/unrepresentable links
+                // (e.g. a relative target that fails normalization).
+                // Surface as an error — there's no recoverable content
+                // to read here.
                 error = RealPathResultError::Invalid;
                 break;
             }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use turbo_rcstr::RcStr;
 use turbo_tasks::Vc;
-use turbo_tasks_fs::{FileContent, FileSystemEntryType, FileSystemPath, LinkContent};
+use turbo_tasks_fs::{FileContent, FileSystemEntryType, FileSystemPath, LinkContent, LinkType};
 
 use crate::{
     asset::{Asset, AssetContent},
@@ -65,11 +65,24 @@ impl Asset for FileSource {
         let file_type = &*self.path.get_type().await?;
         match file_type {
             FileSystemEntryType::Symlink => match &*self.path.read_link().await? {
-                LinkContent::Link { target, link_type } => Ok(AssetContent::Redirect {
-                    target: target.clone(),
-                    link_type: *link_type,
+                LinkContent::Link { target, link_type } => {
+                    // For OUTSIDE_ROOT links (target lives outside the
+                    // configured FS root — pnpm/.aspect_rules_js stores,
+                    // Bazel-sandbox-stashed outputs, etc.) we can't
+                    // emit a Redirect because there's no in-FS target
+                    // to redirect to. Read the bytes directly via the
+                    // OS — `FileSystemPath::read` calls `open(2)` which
+                    // follows the link transparently.
+                    if link_type.contains(LinkType::OUTSIDE_ROOT) {
+                        Ok(AssetContent::File(self.path.read().to_resolved().await?).cell())
+                    } else {
+                        Ok(AssetContent::Redirect {
+                            target: target.clone(),
+                            link_type: *link_type,
+                        }
+                        .cell())
+                    }
                 }
-                .cell()),
                 _ => Err(anyhow::anyhow!("Invalid symlink")),
             },
             FileSystemEntryType::File => {
