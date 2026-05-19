@@ -1,0 +1,246 @@
+name: release-binaries
+
+# Builds the three @next/swc native binaries we consume in savvi-studio
+# (darwin-arm64, linux-x64-gnu, linux-arm64-gnu) and publishes them as
+# GitHub Release assets so we don't have to vendor a 467MB .node into git.
+#
+# Trigger: push a tag matching v*-fastverk* (e.g. v16.1.4-fastverk-extension-alias-1).
+#
+# Each .tgz mimics the layout npm publishes for @next/swc-<platform>:
+# a single `package/` directory containing package.json + next-swc.<platform>.node.
+
+on:
+  push:
+    tags:
+      - 'v*-fastverk*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to use for release asset naming (e.g. v16.1.4-fastverk-extension-alias-1). Must already exist or will be created as a draft.'
+        required: true
+
+# Mirror env from build_and_deploy.yml so we stay on the same toolchain
+# versions Next.js itself uses to ship these binaries.
+env:
+  NAPI_CLI_VERSION: 2.18.4
+  TURBO_VERSION: 2.5.5
+  NODE_LTS_VERSION: 20
+  CARGO_PROFILE_RELEASE_LTO: 'true'
+  # Without this, rust-lld fails because some deps default to newer macOS versions.
+  # See https://doc.rust-lang.org/rustc/platform-support/apple-darwin.html#os-version
+  MACOSX_DEPLOYMENT_TARGET: 11.0
+
+jobs:
+  build-native:
+    name: build ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - target: aarch64-apple-darwin
+            platform: darwin-arm64
+            host: macos-14
+            docker: ''
+            build: |
+              npm i -g "@napi-rs/cli@${NAPI_CLI_VERSION}"
+              pnpm dlx turbo@${TURBO_VERSION} run build-native-release -vvv --env-mode loose --remote-cache-timeout 90 --summarize -- --target aarch64-apple-darwin
+              strip -x packages/next-swc/native/next-swc.*.node
+
+          - target: x86_64-unknown-linux-gnu
+            platform: linux-x64-gnu
+            host: ubuntu-latest
+            # Same docker image Next.js uses to pin the glibc version we link against.
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:stable-2023-09-17-x64
+            build: |
+              apt update
+              apt install -y pkg-config xz-utils dav1d libdav1d-dev
+              rustup show
+              rustup target add x86_64-unknown-linux-gnu
+              npm i -g "@napi-rs/cli@${NAPI_CLI_VERSION}"
+              unset CC_x86_64_unknown_linux_gnu && unset CC
+              cd packages/next-swc
+              npm run build-native-release -- --target x86_64-unknown-linux-gnu
+              strip native/next-swc.*.node
+              objdump -T native/next-swc.*.node | grep GLIBC_ || true
+
+          - target: aarch64-unknown-linux-gnu
+            platform: linux-arm64-gnu
+            # Native ARM runner — simpler than cross-compiling via docker.
+            # Next.js uses a docker image to cross-compile, but GitHub now
+            # offers native arm64 ubuntu runners which avoid that complexity.
+            host: ubuntu-24.04-arm
+            docker: ''
+            build: |
+              sudo apt-get update
+              sudo apt-get install -y pkg-config xz-utils libdav1d-dev
+              npm i -g "@napi-rs/cli@${NAPI_CLI_VERSION}"
+              cd packages/next-swc
+              npm run build-native-release -- --target aarch64-unknown-linux-gnu
+              strip native/next-swc.*.node
+              objdump -T native/next-swc.*.node | grep GLIBC_ || true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # crates/napi/build.rs uses git-describe to find the most recent git tag.
+          fetch-depth: 100
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        if: ${{ !matrix.settings.docker }}
+        with:
+          node-version: ${{ env.NODE_LTS_VERSION }}
+          check-latest: true
+
+      - name: Setup corepack
+        if: ${{ !matrix.settings.docker }}
+        run: |
+          npm i -g corepack@0.31
+          corepack enable
+
+      - name: Install Rust
+        if: ${{ !matrix.settings.docker }}
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Cache rust build
+        if: ${{ !matrix.settings.docker }}
+        uses: ijjk/rust-cache@turbo-cache-v1.0.9
+        with:
+          save-if: 'true'
+          cache-provider: 'turbo'
+          shared-key: release-build-${{ matrix.settings.target }}-${{ hashFiles('.cargo/config.toml') }}
+
+      - name: Clear native build
+        run: rm -rf packages/next-swc/native
+
+      - name: Build (host)
+        if: ${{ !matrix.settings.docker }}
+        run: ${{ matrix.settings.build }}
+
+      - name: Build (docker)
+        if: ${{ matrix.settings.docker }}
+        env:
+          DOCKER_CMD: ${{ matrix.settings.build }}
+        run: |
+          docker run \
+            -e CI -e RUST_BACKTRACE -e NAPI_CLI_VERSION -e CARGO_TERM_COLOR -e CARGO_INCREMENTAL \
+            -e CARGO_PROFILE_RELEASE_LTO -e CARGO_REGISTRIES_CRATES_IO_PROTOCOL \
+            -e TURBO_VERSION -e TURBO_CACHE="local:rw" \
+            -v ${{ github.workspace }}:/build \
+            -w /build \
+            --entrypoint=bash \
+            ${{ matrix.settings.docker }} \
+            -xeo pipefail -c "$DOCKER_CMD"
+
+      - name: Determine tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package as @next/swc-<platform>.tgz
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.settings.platform }}
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          set -euxo pipefail
+
+          # Copy the built binary alongside the template package.json (matches
+          # what scripts/publish-native.js does before `npm publish`).
+          BINARY="next-swc.${PLATFORM}.node"
+          SRC="packages/next-swc/native/${BINARY}"
+          TEMPLATE_DIR="crates/napi/npm/${PLATFORM}"
+
+          if [ ! -f "$SRC" ]; then
+            echo "Expected binary not found at $SRC"
+            ls -la packages/next-swc/native || true
+            exit 1
+          fi
+
+          # Stage a package/ directory — this is what `npm publish` produces:
+          # the tarball root is always `package/`.
+          STAGE="$(mktemp -d)/package"
+          mkdir -p "$STAGE"
+          cp "$SRC" "$STAGE/$BINARY"
+          cp "$TEMPLATE_DIR/package.json" "$STAGE/package.json"
+          if [ -f "$TEMPLATE_DIR/README.md" ]; then
+            cp "$TEMPLATE_DIR/README.md" "$STAGE/README.md"
+          fi
+
+          # Stamp the package version with the tag (strip leading 'v').
+          VERSION="${TAG#v}"
+          node -e "const fs=require('fs');const p='$STAGE/package.json';const j=JSON.parse(fs.readFileSync(p));j.version='$VERSION';fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+
+          # Create the tarball with a predictable filename:
+          # next-swc-<platform>-<tag>.tgz
+          OUT="next-swc-${PLATFORM}-${TAG}.tgz"
+          tar -czf "$OUT" -C "$(dirname "$STAGE")" package
+          mkdir -p dist
+          mv "$OUT" "dist/$OUT"
+          ls -la dist/
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-swc-${{ matrix.settings.platform }}
+          path: dist/*.tgz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build-native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Determine tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: next-swc-*
+          merge-multiple: true
+          path: dist
+
+      - name: List downloaded assets
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: ${{ steps.tag.outputs.value }}
+          draft: false
+          prerelease: true
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          body: |
+            Fastverk fork build of `@next/swc` native binaries.
+
+            Consume in `pnpm-workspace.yaml` (or `package.json#pnpm.overrides`)
+            by pinning each platform to its tarball URL:
+
+            ```
+            "@next/swc-darwin-arm64":   "https://github.com/fastverk/next.js/releases/download/${{ steps.tag.outputs.value }}/next-swc-darwin-arm64-${{ steps.tag.outputs.value }}.tgz"
+            "@next/swc-linux-x64-gnu":  "https://github.com/fastverk/next.js/releases/download/${{ steps.tag.outputs.value }}/next-swc-linux-x64-gnu-${{ steps.tag.outputs.value }}.tgz"
+            "@next/swc-linux-arm64-gnu":"https://github.com/fastverk/next.js/releases/download/${{ steps.tag.outputs.value }}/next-swc-linux-arm64-gnu-${{ steps.tag.outputs.value }}.tgz"
+            ```
+          files: |
+            dist/*.tgz
