@@ -54,6 +54,10 @@ jobs:
             # Same docker image Next.js uses to pin the glibc version we link against.
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:stable-2023-09-17-x64
             build: |
+              # napi-rs/nodejs-rust:2023-09-17-x64 ships a nodesource apt list for
+              # node_18, which has since been retired and returns 404 on `apt update`.
+              # Node 18 is already installed in the image; just drop the dead list.
+              rm -f /etc/apt/sources.list.d/nodesource.list
               apt update
               apt install -y pkg-config xz-utils dav1d libdav1d-dev
               rustup show
@@ -108,11 +112,10 @@ jobs:
 
       - name: Cache rust build
         if: ${{ !matrix.settings.docker }}
-        uses: ijjk/rust-cache@turbo-cache-v1.0.9
+        uses: Swatinem/rust-cache@v2
         with:
+          shared-key: release-build-${{ matrix.settings.target }}
           save-if: 'true'
-          cache-provider: 'turbo'
-          shared-key: release-build-${{ matrix.settings.target }}-${{ hashFiles('.cargo/config.toml') }}
 
       - name: Clear native build
         run: rm -rf packages/next-swc/native
