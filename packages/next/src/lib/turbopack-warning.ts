@@ -21,7 +21,9 @@ const unsupportedTurbopackNextConfigOptions = [
   // 'experimental.serverSourceMaps',
 
   'experimental.allowedRevalidateHeaderKeys',
-  'experimental.extensionAlias',
+  // `extensionAlias` is supported via top-level `turbopack.extensionAlias`
+  // (fork-only extension), so the experimental/webpack-only flag is allowed
+  // to coexist and is no longer flagged.
   'experimental.fallbackNodePolyfills',
 
   'experimental.sri.algorithm',

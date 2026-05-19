@@ -219,6 +219,11 @@ Turbopack can be configured via `next.config.js` (or `next.config.ts`) under the
   Create manual aliases (like `resolve.alias` in webpack).
 - **`resolveExtensions`**
   Change or extend file extensions for module resolution.
+- **`extensionAlias`** (fastverk fork)
+  Map a literal request extension to a list of substitute extensions to try
+  first (mirrors webpack's `resolve.extensionAlias`). Useful for NodeNext
+  workspaces where TypeScript source files are imported with `.js`
+  extensions but live on disk as `.ts`/`.tsx`.
 
 ```js filename="next.config.js"
 module.exports = {
@@ -228,6 +233,13 @@ module.exports = {
       underscore: 'lodash',
     },
     resolveExtensions: ['.mdx', '.tsx', '.ts', '.jsx', '.js', '.json'],
+    // `import './foo.js'` will resolve to `./foo.ts` (or `./foo.tsx`)
+    // when those exist, falling back to `./foo.js`.
+    extensionAlias: {
+      '.js': ['.ts', '.tsx', '.js'],
+      '.jsx': ['.tsx', '.jsx'],
+      '.mjs': ['.mts', '.mjs'],
+    },
   },
 }
 ```

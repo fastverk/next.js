@@ -158,6 +158,18 @@ export interface TurbopackOptions {
   resolveExtensions?: string[]
 
   /**
+   * (`next --turbopack` only) A map from a literal import extension to a list of
+   * substitute extensions to try first. Mirrors webpack's `resolve.extensionAlias`.
+   *
+   * Example:
+   *   extensionAlias: { '.js': ['.ts', '.tsx', '.js'] }
+   *
+   * With this, `import './foo.js'` resolves to `./foo.ts` when it exists,
+   * falling back to `./foo.tsx` then `./foo.js`.
+   */
+  extensionAlias?: Record<string, string | string[]>
+
+  /**
    * (`next --turbopack` only) A list of webpack loaders to apply when running with Turbopack.
    *
    * @see [Turbopack Loaders](https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopack#configuring-webpack-loaders)

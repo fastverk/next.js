@@ -149,6 +149,7 @@ async fn base_resolve_options(
     };
     Ok(ResolveOptions {
         extensions,
+        extension_alias: opt.extension_alias.clone(),
         modules: if let Some(environment) = emulating {
             if *environment.resolve_node_modules().await? {
                 vec![ResolveModules::Nested(

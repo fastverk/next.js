@@ -178,6 +178,7 @@ pub async fn get_edge_resolve_options_context(
         enable_mjs_extension: true,
         enable_edge_node_externals: true,
         custom_extensions: next_config.resolve_extension().owned().await?,
+        extension_alias: next_config.extension_alias().owned().await?,
         tsconfig_path: next_config
             .typescript_tsconfig_path()
             .await?

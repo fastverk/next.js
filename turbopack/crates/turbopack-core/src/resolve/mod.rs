@@ -2280,6 +2280,16 @@ async fn resolve_relative_request(
             /// In just [AddedExtension], [None] or [AddedFragment]
             next: Vec<RequestKeyTransform>,
         },
+        /// User-configured `extension_alias` replacement. `replacement` is the
+        /// substitute extension that we appended (e.g. `.ts`); `original` is
+        /// the extension the user wrote in the request (e.g. `.js`). The
+        /// request key for the resolved file is rewritten back to `original`
+        /// so downstream consumers see the request the user authored.
+        AliasReplacedExtension {
+            replacement: RcStr,
+            original: RcStr,
+            next: Vec<RequestKeyTransform>,
+        },
     }
 
     impl RequestKeyTransform {
@@ -2333,6 +2343,19 @@ async fn resolve_relative_request(
                             old_ext = TS_EXTENSION_REPLACEMENTS.reverse.get(ext).unwrap()
                         )
                         .into();
+                        Self::apply_all(next, &replaced_pattern, fragment, pattern, result);
+                    }
+                }
+                RequestKeyTransform::AliasReplacedExtension {
+                    replacement,
+                    original,
+                    next,
+                } => {
+                    if let Some(stripped_pattern) =
+                        matched_pattern.strip_suffix(replacement.as_str())
+                    {
+                        let replaced_pattern: RcStr =
+                            format!("{stripped_pattern}{original}").into();
                         Self::apply_all(next, &replaced_pattern, fragment, pattern, result);
                     }
                 }
@@ -2459,6 +2482,61 @@ async fn resolve_relative_request(
                 .chain(replaced_extensions.iter().map(|ext| {
                     RequestKeyTransform::ReplacedExtension {
                         ext: ext.clone(),
+                        next: modifications.clone(),
+                    }
+                }))
+                .collect();
+            new_path.normalize();
+        }
+    }
+
+    // User-configured `extension_alias` expansion. For any final-constant that
+    // ends in a configured extension, replace it with an alternative of the
+    // user-provided substitutes. We emit `AliasReplacedExtension` transforms
+    // so each match is rewritten back to the original extension the user typed.
+    if !options_value.extension_alias.is_empty() {
+        // (replacement_ext, original_ext) pairs that we actually emitted, so we
+        // can build the matching `AliasReplacedExtension` undo modifications.
+        let mut emitted_pairs: SmallVec<[(RcStr, RcStr); 4]> = SmallVec::new();
+        let extension_alias = &options_value.extension_alias;
+        let replaced = new_path.replace_final_constants(&mut |c: &RcStr| -> Option<Pattern> {
+            let dot = c.rfind('.')?;
+            let (base, ext) = c.split_at(dot);
+            let (ext, replacements) = extension_alias.get_key_value(ext)?;
+            if replacements.is_empty() {
+                return None;
+            }
+            for replacement in replacements {
+                if replacement != ext
+                    && !emitted_pairs
+                        .iter()
+                        .any(|(r, o)| r == replacement && o == ext)
+                {
+                    emitted_pairs.push((replacement.clone(), ext.clone()));
+                }
+            }
+            let alts: Vec<Pattern> = replacements
+                .iter()
+                .cloned()
+                .map(Pattern::Constant)
+                .collect();
+            if base.is_empty() {
+                Some(Pattern::Alternatives(alts))
+            } else {
+                Some(Pattern::Concatenation(vec![
+                    Pattern::Constant(base.into()),
+                    Pattern::Alternatives(alts),
+                ]))
+            }
+        });
+        if replaced {
+            modifications = modifications
+                .iter()
+                .cloned()
+                .chain(emitted_pairs.iter().map(|(replacement, original)| {
+                    RequestKeyTransform::AliasReplacedExtension {
+                        replacement: replacement.clone(),
+                        original: original.clone(),
                         next: modifications.clone(),
                     }
                 }))
@@ -3466,6 +3544,7 @@ mod tests {
             pattern: rcstr!("./foo.js").into(),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![("./foo.js", "foo.ts")],
         })
         .await;
@@ -3478,6 +3557,7 @@ mod tests {
             pattern: rcstr!("./foo").into(),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![("./foo", "foo.ts")],
         })
         .await;
@@ -3490,6 +3570,7 @@ mod tests {
             pattern: rcstr!("./posts").into(),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![("./posts", "posts.ts")],
         })
         .await;
@@ -3502,6 +3583,7 @@ mod tests {
             pattern: rcstr!("./bar.js").into(),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![("./bar.js", "bar.js")],
         })
         .await;
@@ -3514,6 +3596,7 @@ mod tests {
             pattern: rcstr!("./foo.ts").into(),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![("./foo.ts", "foo.ts")],
         })
         .await;
@@ -3527,6 +3610,7 @@ mod tests {
             pattern: rcstr!("./client#frag").into(),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![("./client", "client.ts")],
         })
         .await;
@@ -3540,6 +3624,7 @@ mod tests {
             pattern: rcstr!("./client#component.js").into(),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             // Whether or not this request key is correct somewhat ambiguous.  It depends on whether
             // or not we consider this fragment to be part of the request pattern
             expected: vec![("./client", "client#component.ts")],
@@ -3555,6 +3640,7 @@ mod tests {
             pattern: rcstr!("./page#section").into(),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![("./page", "page#section.ts")],
         })
         .await;
@@ -3567,6 +3653,7 @@ mod tests {
             pattern: rcstr!("./client?q=s").into(),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![("./client", "client.ts")],
         })
         .await;
@@ -3587,6 +3674,7 @@ mod tests {
             ]),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![
                 ("./src/foo.js", "src/foo.ts"),
                 ("./src/bar.js", "src/bar.js"),
@@ -3608,6 +3696,7 @@ mod tests {
             ]),
             enable_typescript_with_output_extension: true,
             fully_specified: false,
+            extension_alias: vec![],
             expected: vec![
                 ("./src/bar.js", "src/bar.js"),
                 ("./src/bar", "src/bar.js"),
@@ -3624,12 +3713,59 @@ mod tests {
         .await;
     }
 
+    // `extension_alias` fallback tests
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_extension_alias_js_to_ts() {
+        // `import './foo.js'` should resolve to `./foo.ts` when only `.ts` exists.
+        resolve_relative_request_test(TestParams {
+            files: vec!["foo.ts"],
+            pattern: rcstr!("./foo.js").into(),
+            enable_typescript_with_output_extension: false,
+            fully_specified: false,
+            extension_alias: vec![(".js", vec![".ts", ".tsx", ".js"])],
+            // The request key should be rewritten back to what the user wrote.
+            expected: vec![("./foo.js", "foo.ts")],
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_extension_alias_js_fallback_to_js() {
+        // When the configured substitutes don't exist, fall back to the original.
+        resolve_relative_request_test(TestParams {
+            files: vec!["bar.js"],
+            pattern: rcstr!("./bar.js").into(),
+            enable_typescript_with_output_extension: false,
+            fully_specified: false,
+            extension_alias: vec![(".js", vec![".ts", ".tsx", ".js"])],
+            expected: vec![("./bar.js", "bar.js")],
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_extension_alias_ts_priority_over_js() {
+        // With both `.ts` and `.js` on disk, the first substitute (`.ts`) wins.
+        resolve_relative_request_test(TestParams {
+            files: vec!["baz.js", "baz.ts"],
+            pattern: rcstr!("./baz.js").into(),
+            enable_typescript_with_output_extension: false,
+            fully_specified: false,
+            extension_alias: vec![(".js", vec![".ts", ".tsx", ".js"])],
+            expected: vec![("./baz.js", "baz.ts")],
+        })
+        .await;
+    }
+
     /// Parameters for resolve_relative_request_test
     struct TestParams<'a> {
         files: Vec<&'a str>,
         pattern: Pattern,
         enable_typescript_with_output_extension: bool,
         fully_specified: bool,
+        /// Optional `extension_alias` (e.g. `[(".js", &[".ts", ".tsx", ".js"])]`).
+        extension_alias: Vec<(&'a str, Vec<&'a str>)>,
         expected: Vec<(&'a str, &'a str)>,
     }
 
@@ -3640,6 +3776,7 @@ mod tests {
             pattern,
             enable_typescript_with_output_extension,
             fully_specified,
+            extension_alias,
             expected,
         }: TestParams<'_>,
     ) {
@@ -3664,6 +3801,10 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        let extension_alias_owned: Vec<(RcStr, Vec<RcStr>)> = extension_alias
+            .into_iter()
+            .map(|(k, v)| (RcStr::from(k), v.into_iter().map(RcStr::from).collect()))
+            .collect();
 
         let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
             BackendOptions::default(),
@@ -3679,6 +3820,7 @@ mod tests {
                 pattern,
                 enable_typescript_with_output_extension,
                 fully_specified,
+                extension_alias_owned,
             )
             .await?;
 
@@ -3712,6 +3854,7 @@ mod tests {
         pattern: Pattern,
         enable_typescript_with_output_extension: bool,
         fully_specified: bool,
+        extension_alias: Vec<(RcStr, Vec<RcStr>)>,
     ) -> anyhow::Result<Vc<ResolveResult>> {
         let request = Request::parse(pattern.clone());
 
@@ -3722,6 +3865,7 @@ mod tests {
             .await?;
         options_value.enable_typescript_with_output_extension =
             enable_typescript_with_output_extension;
+        options_value.extension_alias = extension_alias.into_iter().collect();
         let options = options_value.clone().cell();
         match &*request.await? {
             Request::Relative {

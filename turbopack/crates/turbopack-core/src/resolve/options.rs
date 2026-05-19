@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use bincode::{Decode, Encode};
 use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{
-    FxIndexSet, NonLocalValue, ResolvedVc, TryJoinIterExt, ValueToString, Vc,
+    FxIndexMap, FxIndexSet, NonLocalValue, ResolvedVc, TryJoinIterExt, ValueToString, Vc,
     debug::ValueDebugFormat, trace::TraceRawVcs,
 };
 use turbo_tasks_fs::{FileSystemPath, glob::Glob};
@@ -620,6 +620,14 @@ pub struct ResolveOptions {
     pub prefer_relative: bool,
     /// The extensions that should be added to a request when resolving.
     pub extensions: Vec<RcStr>,
+    /// A mapping from a literal request extension (e.g. `.js`) to a list of
+    /// substitute extensions (e.g. `[".ts", ".tsx", ".js"]`) to try in order
+    /// when the file with the original extension does not exist.
+    ///
+    /// Mirrors webpack's `resolve.extensionAlias` and is wired into the
+    /// Turbopack resolver in [`crate::resolve::resolve_relative_request`].
+    #[bincode(with = "turbo_bincode::indexmap")]
+    pub extension_alias: FxIndexMap<RcStr, Vec<RcStr>>,
     /// The locations where to resolve modules.
     pub modules: Vec<ResolveModules>,
     /// How to resolve packages.

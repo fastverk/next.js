@@ -604,6 +604,14 @@ pub struct TurbopackConfig {
     #[bincode(with = "turbo_bincode::serde_self_describing")]
     pub resolve_alias: Option<FxIndexMap<RcStr, JsonValue>>,
     pub resolve_extensions: Option<Vec<RcStr>>,
+    /// Maps a literal request extension (e.g. `.js`) to a list of substitute
+    /// extensions to try when the file with the original extension does not
+    /// exist. Mirrors webpack's `resolve.extensionAlias`.
+    ///
+    /// The value is either a single string or an array of strings; the
+    /// flattened-to-`Vec<RcStr>` form is computed in [`NextConfig::extension_alias`].
+    #[bincode(with = "turbo_bincode::serde_self_describing")]
+    pub extension_alias: Option<FxIndexMap<RcStr, JsonValue>>,
     pub debug_ids: Option<bool>,
 }
 
@@ -1211,6 +1219,11 @@ impl RemoveConsoleConfig {
 pub struct ResolveExtensions(Option<Vec<RcStr>>);
 
 #[turbo_tasks::value(transparent)]
+pub struct ExtensionAlias(
+    #[bincode(with = "turbo_bincode::indexmap")] FxIndexMap<RcStr, Vec<RcStr>>,
+);
+
+#[turbo_tasks::value(transparent)]
 pub struct SwcPlugins(
     #[bincode(with = "turbo_bincode::serde_self_describing")] Vec<(RcStr, serde_json::Value)>,
 );
@@ -1572,6 +1585,41 @@ impl NextConfig {
             return Vc::cell(None);
         };
         Vc::cell(Some(resolve_extensions.clone()))
+    }
+
+    /// Returns the `turbopack.extensionAlias` configuration normalized into a
+    /// map from `.<ext>` -> `[".<replacement>", ...]`. Returns an empty map if
+    /// the option is not set.
+    #[turbo_tasks::function]
+    pub fn extension_alias(&self) -> Result<Vc<ExtensionAlias>> {
+        let Some(raw) = self
+            .turbopack
+            .as_ref()
+            .and_then(|t| t.extension_alias.as_ref())
+        else {
+            return Ok(Vc::cell(FxIndexMap::default()));
+        };
+        let mut out: FxIndexMap<RcStr, Vec<RcStr>> = FxIndexMap::default();
+        for (k, v) in raw {
+            let replacements: Vec<RcStr> = match v {
+                JsonValue::String(s) => vec![RcStr::from(s.as_str())],
+                JsonValue::Array(items) => items
+                    .iter()
+                    .map(|item| match item {
+                        JsonValue::String(s) => Ok(RcStr::from(s.as_str())),
+                        _ => {
+                            bail!("turbopack.extensionAlias values must be strings, got: {item:?}")
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                _ => bail!(
+                    "turbopack.extensionAlias entries must be a string or an array of strings, \
+                     got: {v:?}"
+                ),
+            };
+            out.insert(k.clone(), replacements);
+        }
+        Ok(Vc::cell(out))
     }
 
     #[turbo_tasks::function]

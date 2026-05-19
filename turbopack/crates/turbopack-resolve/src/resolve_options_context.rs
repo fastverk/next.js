@@ -1,6 +1,6 @@
 use anyhow::Result;
 use turbo_rcstr::RcStr;
-use turbo_tasks::{ResolvedVc, ValueDefault, Vc};
+use turbo_tasks::{FxIndexMap, ResolvedVc, ValueDefault, Vc};
 use turbo_tasks_fs::FileSystemPath;
 use turbopack_core::{
     condition::ContextCondition,
@@ -39,6 +39,10 @@ pub struct ResolveOptionsContext {
     pub module: bool,
     pub custom_conditions: Vec<RcStr>,
     pub custom_extensions: Option<Vec<RcStr>>,
+    /// Maps a literal request extension (e.g. `.js`) to a list of substitute
+    /// extensions to try first. Mirrors webpack's `resolve.extensionAlias`.
+    #[bincode(with = "turbo_bincode::indexmap")]
+    pub extension_alias: FxIndexMap<RcStr, Vec<RcStr>>,
     /// An additional import map to use when resolving modules.
     ///
     /// If set, this import map will be applied to `ResolveOption::import_map`.

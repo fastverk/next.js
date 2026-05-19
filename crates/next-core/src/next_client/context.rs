@@ -205,6 +205,7 @@ pub async fn get_client_resolve_options_context(
         enable_react: true,
         enable_mjs_extension: true,
         custom_extensions: next_config.resolve_extension().owned().await?,
+        extension_alias: next_config.extension_alias().owned().await?,
         tsconfig_path,
         rules: vec![(
             foreign_code_context_condition(next_config, project_path).await?,
