@@ -2763,9 +2763,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_read_matches_outside_root_symlink_directory() {
-        #[turbo_tasks::function(operation, root)]
+        #[turbo_tasks::function(operation)]
         async fn read_matches_outside_root_operation(root: RcStr) -> anyhow::Result<()> {
-            let root = DiskFileSystem::new(rcstr!("test"), Vc::cell(root))
+            let root = DiskFileSystem::new(rcstr!("test"), root)
                 .root()
                 .owned()
                 .await?;
