@@ -21,15 +21,17 @@ containing `package.json` + `next-swc.<platform>.node`.
    branch the release tag will point at).
 2. Pick a tag name matching `v*-fastverk*`. Convention:
 
-   `v<upstream-version>-fastverk-<short-feature>-<n>`
+   `v<upstream-version>-fastverk-<n>`
 
-   e.g. `v16.1.4-fastverk-extension-alias-1`, then `-2` for the next iteration.
+   One rolling counter that bumps every time `fastverk/patched` gains a new
+   patch — `v16.1.4-fastverk-1`, then `-2`, etc. Reset when bumping the
+   upstream base (e.g. `v16.2.0-fastverk-1`).
 
 3. Tag and push:
 
    ```bash
-   git tag v16.1.4-fastverk-extension-alias-1
-   git push fastverk v16.1.4-fastverk-extension-alias-1
+   git tag v16.1.4-fastverk-1
+   git push fastverk v16.1.4-fastverk-1
    ```
 
 4. The tag push triggers `.github/workflows/release-binaries.yml`. Once all
@@ -59,9 +61,9 @@ registry tarballs, so this drops directly into the existing resolution:
 
 ```yaml
 overrides:
-  '@next/swc-darwin-arm64': 'https://github.com/fastverk/next.js/releases/download/v16.1.4-fastverk-extension-alias-1/next-swc-darwin-arm64-v16.1.4-fastverk-extension-alias-1.tgz'
-  '@next/swc-linux-x64-gnu': 'https://github.com/fastverk/next.js/releases/download/v16.1.4-fastverk-extension-alias-1/next-swc-linux-x64-gnu-v16.1.4-fastverk-extension-alias-1.tgz'
-  '@next/swc-linux-arm64-gnu': 'https://github.com/fastverk/next.js/releases/download/v16.1.4-fastverk-extension-alias-1/next-swc-linux-arm64-gnu-v16.1.4-fastverk-extension-alias-1.tgz'
+  '@next/swc-darwin-arm64': 'https://github.com/fastverk/next.js/releases/download/v16.1.4-fastverk-1/next-swc-darwin-arm64-v16.1.4-fastverk-1.tgz'
+  '@next/swc-linux-x64-gnu': 'https://github.com/fastverk/next.js/releases/download/v16.1.4-fastverk-1/next-swc-linux-x64-gnu-v16.1.4-fastverk-1.tgz'
+  '@next/swc-linux-arm64-gnu': 'https://github.com/fastverk/next.js/releases/download/v16.1.4-fastverk-1/next-swc-linux-arm64-gnu-v16.1.4-fastverk-1.tgz'
 ```
 
 After updating, `pnpm install --force` to refetch.
